@@ -9,16 +9,13 @@ import java.util.*;
 import static org.apache.spark.sql.functions.*;
 
 /**
- * 非核心埋点逐级补充算法 V4 —— 精简输出 + 极致性能。
+ * 非核心埋点逐级补充算法 V5 —— nUV²/PV 排序公式。
  *
- * 相比 V3 改动：
- *   1. 输出仅 7 列（去 total_uv/total_pv/core_uv/core_pv/uv_rate/pv_growth），内存减半
- *   2. 合并全局+核心指标为一次 agg 扫描
- *   3. sourceDF 按 imei 重分布 + 立即物化缓存
- *   4. HashMap/HashSet 预分配容量，避免扩容
- *   5. eventMeta 直接按 index 赋值，省去中间 List 和重复 getString
+ * 相比 V4 改动：
+ *   1. 排序公式由 nUV/PV 改为 nUV²/PV，更激进地偏向高覆盖事件
+ *   2. 其余逻辑与 V4 保持一致
  */
-public class EventSupplementByMinPvEntry_V4 {
+public class EventSupplementByMinPvEntry_V5 {
 
     public static void main(String[] args) {
         if (args.length < 2) {
@@ -31,7 +28,7 @@ public class EventSupplementByMinPvEntry_V4 {
         int topN = args.length > 2 ? Integer.parseInt(args[2]) : Integer.MAX_VALUE;
 
         SparkSession spark = SparkSession.builder()
-                .appName("EventSupplementByMinPvEntry_V4_" + dt + "_" + bg)
+                .appName("EventSupplementByMinPvEntry_V5_" + dt + "_" + bg)
                 .enableHiveSupport()
                 .config("hive.exec.dynamic.partition.mode", "nonstrict")
                 .getOrCreate();
@@ -41,7 +38,7 @@ public class EventSupplementByMinPvEntry_V4 {
         spark.conf().set("spark.sql.adaptive.coalescePartitions.enabled", "true");
 
         String sourceTable = "hdp_teu_dpd_wx_flow.jf_event_impact_daily_v4";
-        String targetTable = "hdp_teu_dpd_wx_flow.jf_event_supplement_by_pv_rank_v4";
+        String targetTable = "hdp_teu_dpd_wx_flow.jf_event_supplement_by_pv_rank_v5";
 
         // ========== 1. 读取源表，按 imei 重分布后缓存并立即物化 ==========
         Dataset<Row> sourceDF = spark.table(sourceTable)
@@ -189,7 +186,7 @@ public class EventSupplementByMinPvEntry_V4 {
                     activeEventIds[i] = activeEventIds[--activeCount];
                     continue;
                 }
-                double score = (double) nUV / eventPVs[eid];
+                double score = (double) nUV * nUV / eventPVs[eid];
                 if (score > bestScore) {
                     bestScore = score;
                     bestId = eid;
