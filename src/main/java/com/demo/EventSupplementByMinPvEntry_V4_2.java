@@ -1,0 +1,301 @@
+package com.demo;
+
+import org.apache.spark.sql.*;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructType;
+
+import java.util.*;
+
+import static org.apache.spark.sql.functions.*;
+
+/**
+ * 非核心埋点逐级补充算法 V4_2 —— V4 + 事件质量过滤。
+ *
+ * 相比 V4 改动：
+ *   1. 新增 minNewUV 参数：事件初始 UV 低于此值则丢弃，默认 100
+ *   2. 新增 maxPVPerUV 参数：事件 PV/初始UV 高于此值则丢弃，默认 100000
+ *   3. 参数顺序：dt bg [topN] [minNewUV] [maxPVPerUV]
+ */
+public class EventSupplementByMinPvEntry_V4_2 {
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.err.println("必须提供 dt 和 bg 参数");
+            System.err.println("可选: topN minNewUV maxPVPerUV");
+            System.err.println("  topN:        最大补充步数，默认无限");
+            System.err.println("  minNewUV:    事件最小初始UV，低于此值丢弃，默认100");
+            System.err.println("  maxPVPerUV:  事件最大PV/UV比，高于此值丢弃，默认100000");
+            System.exit(1);
+        }
+
+        String dt = args[0];
+        String bg = args[1];
+        int topN = args.length > 2 ? Integer.parseInt(args[2]) : Integer.MAX_VALUE;
+        long minNewUV = args.length > 3 ? Long.parseLong(args[3]) : 100L;
+        long maxPVPerUV = args.length > 4 ? Long.parseLong(args[4]) : 100000L;
+
+        SparkSession spark = SparkSession.builder()
+                .appName("EventSupplementByMinPvEntry_V4_2_" + dt + "_" + bg)
+                .enableHiveSupport()
+                .config("hive.exec.dynamic.partition.mode", "nonstrict")
+                .getOrCreate();
+
+        spark.conf().set("spark.sql.shuffle.partitions", "800");
+        spark.conf().set("spark.sql.adaptive.enabled", "true");
+        spark.conf().set("spark.sql.adaptive.coalescePartitions.enabled", "true");
+
+        String sourceTable = "hdp_teu_dpd_wx_flow.jf_event_impact_daily_v4";
+        String targetTable = "hdp_teu_dpd_wx_flow.jf_event_supplement_by_pv_rank_v4_2";
+
+        // ========== 1. 读取源表，按 imei 重分布后缓存并立即物化 ==========
+        Dataset<Row> sourceDF = spark.table(sourceTable)
+                .filter(col("dt").equalTo(dt).and(col("bg").equalTo(bg)))
+                .repartition(800, col("imei"))
+                .cache();
+        sourceDF.count();
+
+        // ========== 2. 全局 + 核心指标（一次 agg，省一次全表扫描）==========
+        Row metrics = sourceDF.agg(
+                countDistinct("imei").as("total_uv"),
+                sum("pv").as("total_pv"),
+                countDistinct(when(col("is_core").equalTo(1), col("imei"))).as("core_uv"),
+                sum(when(col("is_core").equalTo(1), col("pv")).otherwise(0L)).as("core_pv")
+        ).head();
+
+        long totalUV = metrics.getLong(0);
+        long totalPV = metrics.getLong(1);
+        long coreUV  = metrics.getLong(2);
+        long corePV  = metrics.getLong(3);
+
+        System.out.printf("总UV=%d 总PV=%d 核心UV=%d 核心PV=%d%n", totalUV, totalPV, coreUV, corePV);
+        System.out.printf("过滤阈值: minNewUV=%d  maxPVPerUV=%d%n", minNewUV, maxPVPerUV);
+
+        // ========== 3. 核心用户列表 ==========
+        Dataset<Row> coreUserDF = sourceDF
+                .filter(col("is_core").equalTo(1))
+                .select("imei").distinct();
+
+        // ========== 4. 非核心用户数据 ==========
+        Dataset<Row> nonCoreDF = sourceDF
+                .filter(col("is_core").equalTo(0))
+                .select(col("pagetype"), col("actiontype"), col("imei"), col("pv"))
+                .cache();
+
+        long nonCoreUserEstimate = totalUV - coreUV;
+
+        Dataset<Row> pureNonCoreDF = nonCoreDF
+                .join(broadcast(coreUserDF), nonCoreDF.col("imei").equalTo(coreUserDF.col("imei")), "left_anti")
+                .cache();
+
+        // ========== 5. Collect 到 Driver ==========
+        List<Row> eventMeta = sourceDF
+                .groupBy(col("pagetype"), col("actiontype"))
+                .agg(sum("pv").as("event_pv"))
+                .collectAsList();
+
+        List<Row> userPairs = pureNonCoreDF
+                .select("pagetype", "actiontype", "imei")
+                .distinct()
+                .collectAsList();
+
+        System.out.printf("事件数=%d 用户-事件对=%d%n", eventMeta.size(), userPairs.size());
+
+        // ---- 阶段一：事件ID映射 + 元数据数组（按 index 直接赋值）----
+        int numEvents = eventMeta.size();
+        Map<String, Integer> eventKeyToId = new HashMap<>(numEvents * 2);
+        String[] eventPagetypes = new String[numEvents];
+        String[] eventActiontypes = new String[numEvents];
+        long[] eventPVs = new long[numEvents];
+
+        for (int i = 0; i < numEvents; i++) {
+            Row r = eventMeta.get(i);
+            String pagetype = r.getString(0);
+            String actiontype = r.getString(1);
+            eventKeyToId.put(pagetype + "|" + actiontype, i);
+            eventPagetypes[i] = pagetype;
+            eventActiontypes[i] = actiontype;
+            eventPVs[i] = r.getLong(2);
+        }
+        eventMeta = null;
+
+        // ---- 阶段二：构建 eventUsersSets 和倒排索引 ----
+        @SuppressWarnings("unchecked")
+        Set<String>[] eventUsersSets = new Set[numEvents];
+        for (int i = 0; i < numEvents; i++) {
+            eventUsersSets[i] = new HashSet<>();
+        }
+
+        Map<String, List<Integer>> imeiToEventIds = new HashMap<>((int) (nonCoreUserEstimate * 1.5));
+
+        for (Row r : userPairs) {
+            String key = r.getString(0) + "|" + r.getString(1);
+            Integer eventId = eventKeyToId.get(key);
+            if (eventId == null) continue;
+
+            String imei = r.getString(2);
+            eventUsersSets[eventId].add(imei);
+
+            List<Integer> list = imeiToEventIds.get(imei);
+            if (list == null) {
+                list = new ArrayList<>(2);
+                imeiToEventIds.put(imei, list);
+            }
+            list.add(eventId);
+        }
+        userPairs = null;
+
+        // ---- 阶段三：初始化计数器（含质量过滤）----
+        long[] eventRemainingNewUV = new long[numEvents];
+        int[] activeEventIds = new int[numEvents];
+        int activeCount = 0;
+        int filteredByMinUV = 0;
+        int filteredByPVRatio = 0;
+
+        for (int i = 0; i < numEvents; i++) {
+            long uv = eventUsersSets[i].size();
+            eventRemainingNewUV[i] = uv;
+            if (uv == 0) continue;
+
+            // 质量过滤：初始 UV 太小
+            if (uv < minNewUV) {
+                filteredByMinUV++;
+                continue;
+            }
+            // 质量过滤：PV / UV 过高（高成本低回报）
+            if (eventPVs[i] / uv > maxPVPerUV) {
+                filteredByPVRatio++;
+                continue;
+            }
+            activeEventIds[activeCount++] = i;
+        }
+
+        System.out.printf("事件过滤: 初始UV<%d 过滤%d个 | PV/UV>%d 过滤%d个 | 有效事件=%d%n",
+                minNewUV, filteredByMinUV, maxPVPerUV, filteredByPVRatio, activeCount);
+
+        eventKeyToId = null;
+        Set<String> covered = new HashSet<>((int) (nonCoreUserEstimate * 1.5));
+
+        // ========== 6. 贪心选择 ==========
+        List<Map<String, Object>> stepRows = new ArrayList<>();
+
+        // Step 0 基线（仅 7 字段）
+        Map<String, Object> s0 = new LinkedHashMap<>(8);
+        s0.put("supplement_step", 0);
+        s0.put("supplemented_pagetype", "");
+        s0.put("supplemented_actiontype", "");
+        s0.put("supplemented_event_pv", 0L);
+        s0.put("new_uv_gained", 0L);
+        s0.put("cum_uv", coreUV);
+        s0.put("cum_pv", corePV);
+        stepRows.add(s0);
+
+        long cumUV = coreUV;
+        long cumPV = corePV;
+        int step = 0;
+
+        System.out.printf("Step %4d | %-20s %-25s | PV=+%10d | UV=+%8d | cumUV=%10d | cumPV=%15d%n",
+                0, "[基线]", "", 0, 0, cumUV, cumPV);
+
+        while (activeCount > 0 && step < topN) {
+            int bestId = -1;
+            int bestIdx = -1;
+            double bestScore = -1;
+            long bestNewUV = 0;
+
+            for (int i = 0; i < activeCount; ) {
+                int eid = activeEventIds[i];
+                long nUV = eventRemainingNewUV[eid];
+                if (nUV == 0) {
+                    activeEventIds[i] = activeEventIds[--activeCount];
+                    continue;
+                }
+                double score = (double) nUV / eventPVs[eid];
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestId = eid;
+                    bestIdx = i;
+                    bestNewUV = nUV;
+                }
+                i++;
+            }
+
+            if (bestId == -1) break;
+
+            step++;
+            activeEventIds[bestIdx] = activeEventIds[--activeCount];
+
+            // 增量更新
+            for (String u : eventUsersSets[bestId]) {
+                if (!covered.add(u)) continue;
+                List<Integer> affected = imeiToEventIds.get(u);
+                if (affected != null) {
+                    for (int aid : affected) {
+                        eventRemainingNewUV[aid]--;
+                    }
+                }
+            }
+
+            long bestPV = eventPVs[bestId];
+            cumUV += bestNewUV;
+            cumPV += bestPV;
+
+            Map<String, Object> row = new LinkedHashMap<>(8);
+            row.put("supplement_step", step);
+            row.put("supplemented_pagetype", eventPagetypes[bestId]);
+            row.put("supplemented_actiontype", eventActiontypes[bestId]);
+            row.put("supplemented_event_pv", bestPV);
+            row.put("new_uv_gained", bestNewUV);
+            row.put("cum_uv", cumUV);
+            row.put("cum_pv", cumPV);
+            stepRows.add(row);
+
+            System.out.printf("Step %4d | %-20s %-25s | PV=+%10d | UV=+%8d | cumUV=%10d | cumPV=%15d%n",
+                    step, eventPagetypes[bestId], eventActiontypes[bestId],
+                    bestPV, bestNewUV, cumUV, cumPV);
+        }
+
+        System.out.printf("%n===== 补充完成：%d 步 | UV %d→%d | PV %d→%d =====%n",
+                step, coreUV, cumUV, corePV, cumPV);
+
+        // ========== 7. 写回 Hive（仅 7 列）==========
+        StructType outputSchema = new StructType()
+                .add("supplement_step",           DataTypes.IntegerType)
+                .add("supplemented_pagetype",     DataTypes.StringType)
+                .add("supplemented_actiontype",   DataTypes.StringType)
+                .add("supplemented_event_pv",     DataTypes.LongType)
+                .add("new_uv_gained",             DataTypes.LongType)
+                .add("cum_uv",                    DataTypes.LongType)
+                .add("cum_pv",                    DataTypes.LongType);
+
+        List<Row> sparkRows = new ArrayList<>(stepRows.size());
+        for (Map<String, Object> row : stepRows) {
+            sparkRows.add(RowFactory.create(
+                    row.get("supplement_step"),
+                    row.get("supplemented_pagetype"),
+                    row.get("supplemented_actiontype"),
+                    row.get("supplemented_event_pv"),
+                    row.get("new_uv_gained"),
+                    row.get("cum_uv"),
+                    row.get("cum_pv")
+            ));
+        }
+
+        Dataset<Row> resultDF = spark.createDataFrame(sparkRows, outputSchema);
+        resultDF.createOrReplaceTempView("tmp_supplement_result");
+        spark.sql(
+                "INSERT OVERWRITE TABLE " + targetTable +
+                        " PARTITION(dt='" + dt + "', bg='" + bg + "')" +
+                        " SELECT supplement_step, supplemented_pagetype, supplemented_actiontype," +
+                        "        supplemented_event_pv, new_uv_gained," +
+                        "        cum_uv, cum_pv" +
+                        " FROM tmp_supplement_result"
+        );
+
+        nonCoreDF.unpersist();
+        pureNonCoreDF.unpersist();
+        sourceDF.unpersist();
+
+        System.out.println("结果已写入 " + targetTable);
+        spark.stop();
+    }
+}
